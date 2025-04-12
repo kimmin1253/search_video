@@ -5,7 +5,7 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-# [변경] 최신 모듈로부터 임포트 (langchain-community 및 langchain-huggingface)
+# 최신 모듈 임포트 (langchain-community 및 langchain-huggingface)
 from langchain_community.embeddings import HuggingFaceEmbeddings  # (옵션)
 from langchain_huggingface import HuggingFaceEndpoint
 from langchain.memory import ConversationBufferMemory
@@ -16,7 +16,7 @@ from utils import get_db_connection, format_hhmmss, MEMBER_NAME_MAP
 chat_bp = Blueprint('chat_bp', __name__)
 
 #########################################
-# [변경] 전역 FAISS 인덱스 및 메타데이터 구축
+# 전역 FAISS 인덱스 및 메타데이터 구축
 #########################################
 
 # 1. SBERT 모델 로드 (임베딩 계산용)
@@ -27,7 +27,7 @@ with open("data/combined_metadata.json", "r", encoding="utf-8") as f:
     combined_data = json.load(f)
 
 # 3. 세그먼트 정보와 임베딩 벡터 리스트 생성
-segments_meta = []       # 각 세그먼트의 추가 정보 저장 (video_id, start_time, caption, 등)
+segments_meta = []       # 각 세그먼트의 추가 정보 (video_id, start_time, caption 등)
 embeddings_list = []     # 각 캡션의 128차원 임베딩
 
 for seg in combined_data:
@@ -37,7 +37,7 @@ for seg in combined_data:
     seg_info = {
         "video_id": video_id,
         "start_time": timestamp,
-        "end_time": timestamp + 1.0,  # 여기서는 1초 길이라고 가정
+        "end_time": timestamp + 1.0,  # 1초 길이라고 가정
         "caption": caption,
         "faces": seg.get("faces", [])
     }
@@ -51,22 +51,18 @@ faiss_index = faiss.IndexFlatL2(d)
 faiss_index.add(embeddings_array)
 
 #########################################
-# [변경] LangChain 기반 LLM 구성 및 검색 함수
+# LangChain 기반 LLM 구성 및 검색 함수
 #########################################
-# 최신 HuggingFaceEndpoint를 사용하여 LLM 구성
-# max_new_tokens를 명시적으로 150으로 지정하여 오류를 피합니다.
-llm = HuggingFaceEndpoint(
-    repo_id="google/flan-t5-base",
-    huggingfacehub_api_token=HUGGINGFACE_API_KEY,
-    temperature=0.7,
-    max_new_tokens=150,
-    task="text2text-generation",  # 작업을 명시적으로 지정
-    model_kwargs={}               # 불필요한 파라미터를 보내지 않음
-)
+# 여기서는 경량 모델 MBZUAI/LaMini-Flan-T5-248M을 사용하도록 설정
+from transformers import pipeline
+from langchain_huggingface import HuggingFacePipeline
+
+pipe = pipeline("text2text-generation", model="MBZUAI/LaMini-Flan-T5-248M", device=-1)  # device=-1 for CPU; device=0 for GPU
+llm = HuggingFacePipeline(pipeline=pipe)
 
 
 
-# (선택사항) 대화 메모리 추가 – 멀티턴 대화 지원
+# (선택사항) 대화 메모리 추가 – 멀티턴 대화 지원 (경고는 있으나 데모에는 크게 문제없음)
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 def faiss_retriever(query, top_k=4):
@@ -89,7 +85,7 @@ def generate_answer_with_retrieval(query: str) -> str:
         context_lines.append(f"[{seg['video_id']} {start_hms} ~ {end_hms}] {cap}")
     context_text = "\n".join(context_lines)
     
-    # 새 프롬프트 구성: 검색된 문맥(context)와 사용자 입력 결합
+    # 프롬프트 구성: 검색한 문맥(context)와 사용자 입력 결합
     prompt = f"""
 Context:
 {context_text}
@@ -99,6 +95,7 @@ Context:
 요청:
 위 문맥을 바탕으로, 검색어와 가장 유사한 장면에 대한 내용을 자연스러운 한국어로 요약해 주세요.
     """
+    # 호출 시 새로운 방식인 invoke() 사용
     response = llm.invoke(prompt)
     return response.strip()
 
@@ -125,7 +122,7 @@ def unified_chat():
     if not user_msg:
         return jsonify({"error": "No message provided"}), 400
 
-    # 1) 수정 명령 ("수정:" 모드) - 기존 수정 로직 그대로 유지
+    # 1) 수정 명령 ("수정:" 모드) – 기존 로직 유지
     override_pattern = r'^수정:\s*세그먼트ID=(\d+)\s*내용=(.*?)(?:\s+멤버=(.*))?$'
     if user_msg.startswith("수정:"):
         match = re.match(override_pattern, user_msg)
@@ -207,7 +204,7 @@ def unified_chat():
         else:
             return jsonify({"response": "수정 명령 형식이 올바르지 않습니다."})
 
-    # 2) 질문 ("질문:" 모드) - 기존 질문 로직 그대로 유지
+    # 2) 질문 ("질문:" 모드) – 기존 로직 그대로 유지
     elif user_msg.startswith("질문:"):
         question = user_msg[len("질문:"):].strip()
         conn = get_db_connection()
@@ -301,7 +298,7 @@ def unified_chat():
         response_text = f"검색 결과:\n{summary_text}"
         return jsonify({"response": response_text})
 
-    # 3) 기본 검색 로직 - [변경] FAISS 및 LangChain 기반 RAG 방식 적용
+    # 3) 기본 검색 로직 – FAISS 및 LangChain 기반 RAG 방식 적용
     else:
         chat_response = generate_answer_with_retrieval(user_msg)
         return jsonify({"response": chat_response})
