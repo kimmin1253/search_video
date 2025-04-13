@@ -7,11 +7,14 @@ from sentence_transformers import SentenceTransformer
 
 # 최신 모듈 임포트 (langchain-community 및 langchain-huggingface)
 from langchain_community.embeddings import HuggingFaceEmbeddings  # (옵션)
-from langchain_huggingface import HuggingFaceEndpoint
+from langchain_huggingface import HuggingFacePipeline
 from langchain.memory import ConversationBufferMemory
 
 from config import search_model, HUGGINGFACE_API_KEY  # config에서 API 키 불러오기
 from utils import get_db_connection, format_hhmmss, MEMBER_NAME_MAP
+
+# 추가: agent_tools 모듈 (영상 구간 요약, 클립 생성 등)
+from agent_tools import summarize_video_range, extract_video_clip
 
 chat_bp = Blueprint('chat_bp', __name__)
 
@@ -27,14 +30,15 @@ with open("data/combined_metadata.json", "r", encoding="utf-8") as f:
     combined_data = json.load(f)
 
 # 3. 세그먼트 정보와 임베딩 벡터 리스트 생성
-segments_meta = []       # 각 세그먼트의 추가 정보 (video_id, start_time, caption 등)
+segments_meta = []       # 각 세그먼트의 추가 정보 (video_id, start_time, caption, faces 등)
 embeddings_list = []     # 각 캡션의 128차원 임베딩
 
-for seg in combined_data:
+for idx, seg in enumerate(combined_data):
     video_id = seg.get("video_id", "default_video")
     timestamp = float(seg.get("timestamp", 0))
     caption = seg.get("caption", "")
     seg_info = {
+        "id": idx,  # 여기서는 인덱스 번호를 세그먼트 ID로 사용
         "video_id": video_id,
         "start_time": timestamp,
         "end_time": timestamp + 1.0,  # 1초 길이라고 가정
@@ -53,16 +57,12 @@ faiss_index.add(embeddings_array)
 #########################################
 # LangChain 기반 LLM 구성 및 검색 함수
 #########################################
-# 여기서는 경량 모델 MBZUAI/LaMini-Flan-T5-248M을 사용하도록 설정
 from transformers import pipeline
-from langchain_huggingface import HuggingFacePipeline
-
-pipe = pipeline("text2text-generation", model="MBZUAI/LaMini-Flan-T5-248M", device=-1)  # device=-1 for CPU; device=0 for GPU
+# 여기서는 텍스트-투-텍스트 생성을 위해 경량 모델 google/flan-t5-small을 사용
+pipe = pipeline("text2text-generation", model="google/flan-t5-small", device=-1)
 llm = HuggingFacePipeline(pipeline=pipe)
 
-
-
-# (선택사항) 대화 메모리 추가 – 멀티턴 대화 지원 (경고는 있으나 데모에는 크게 문제없음)
+# (선택사항) 대화 메모리 추가 – 멀티턴 대화 지원
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 def faiss_retriever(query, top_k=4):
@@ -82,22 +82,38 @@ def generate_answer_with_retrieval(query: str) -> str:
         start_hms = format_hhmmss(seg["start_time"])
         end_hms = format_hhmmss(seg["end_time"])
         cap = seg["caption"]
-        context_lines.append(f"[{seg['video_id']} {start_hms} ~ {end_hms}] {cap}")
+        context_lines.append(
+            f"[세그먼트ID={seg['id']} (start_sec={seg['start_time']}, end_sec={seg['end_time']})]\n"
+            f"{start_hms} ~ {end_hms}\n"
+            f"{cap}\n"
+            f"[수정하기={seg['id']}]\n"
+        )
     context_text = "\n".join(context_lines)
     
-    # 프롬프트 구성: 검색한 문맥(context)와 사용자 입력 결합
+    # MEMBER_NAME_MAP 정보를 프롬프트에 추가
+    mapping_info = (
+        "참고: 등장인물 이름 매핑\n"
+        "강해린: Gang Harin, 해린: Gang Harin, 고양이: Gang Harin, "
+        "김민지: Kim Minji, 민지: Kim Minji, 킴민지: Kim Minji, "
+        "팜하니: Pham Hanni, 하니: Pham Hanni, 하니팜: Pham Hanni, "
+        "다니엘: Danielle, 다니: Danielle."
+    )
+    
     prompt = f"""
 Context:
 {context_text}
 
+{mapping_info}
+
 사용자 입력: "{query}"
 
 요청:
-위 문맥을 바탕으로, 검색어와 가장 유사한 장면에 대한 내용을 자연스러운 한국어로 요약해 주세요.
-    """
-    # 호출 시 새로운 방식인 invoke() 사용
+위 문맥과 등장인물 매핑 정보를 참고하여, 검색어와 가장 유사한 장면의 내용을 한국어로 요약해 주세요.
+   """
     response = llm.invoke(prompt)
     return response.strip()
+
+
 
 #########################################
 # 기존 helper 함수 (변경 없음)
@@ -122,7 +138,8 @@ def unified_chat():
     if not user_msg:
         return jsonify({"error": "No message provided"}), 400
 
-    # 1) 수정 명령 ("수정:" 모드) – 기존 로직 유지
+    # 분기 처리:
+    # 1) 수정 명령 ("수정:" 모드)
     override_pattern = r'^수정:\s*세그먼트ID=(\d+)\s*내용=(.*?)(?:\s+멤버=(.*))?$'
     if user_msg.startswith("수정:"):
         match = re.match(override_pattern, user_msg)
@@ -203,8 +220,8 @@ def unified_chat():
             return jsonify({"response": f"세그먼트 {seg_id} 캡션이 수정되었습니다."})
         else:
             return jsonify({"response": "수정 명령 형식이 올바르지 않습니다."})
-
-    # 2) 질문 ("질문:" 모드) – 기존 로직 그대로 유지
+    
+    # 2) 질문 ("질문:" 모드)
     elif user_msg.startswith("질문:"):
         question = user_msg[len("질문:"):].strip()
         conn = get_db_connection()
@@ -297,8 +314,41 @@ def unified_chat():
         summary_text = "\n".join(summary_lines)
         response_text = f"검색 결과:\n{summary_text}"
         return jsonify({"response": response_text})
+    
+    # 3) "요약:" 분기 – 영상 구간 요약 요청 (예: "요약: 60 90")
+    elif user_msg.startswith("요약:"):
+        parts = user_msg.split()
+        if len(parts) >= 3:
+            try:
+                start_sec = float(parts[1])
+                end_sec = float(parts[2])
+                member_query = parts[3] if len(parts) >= 4 else None
+                from agent_tools import summarize_video_range
 
-    # 3) 기본 검색 로직 – FAISS 및 LangChain 기반 RAG 방식 적용
+                summary = summarize_video_range(start_sec, end_sec, segments_meta, member_query)
+                return jsonify({"response": summary})
+            except ValueError:
+                return jsonify({"response": "시간 정보를 숫자로 입력해 주세요."})
+        else:
+            return jsonify({"response": "요약 명령 형식: '요약: 시작초 종료초'"})
+    
+    # 4) "클립:" 분기 – 영상 클립 생성 요청 (예: "클립: 60 100")
+    elif user_msg.startswith("클립:"):
+        parts = user_msg.split()
+        if len(parts) >= 3:
+            try:
+                start_sec = float(parts[1])
+                end_sec = float(parts[2])
+                video_path = "FuJ1RiLoq-M.mp4"  # 영상 파일 경로 (필요에 따라 조정)
+                output_path = f"clip_{int(start_sec)}_{int(end_sec)}.mp4"
+                result = extract_video_clip(video_path, start_sec, end_sec, output_path)
+                return jsonify({"response": f"클립 생성 완료: {result}"})
+            except ValueError:
+                return jsonify({"response": "시간 정보를 숫자로 입력해 주세요."})
+        else:
+            return jsonify({"response": "클립 명령어 형식: '클립: 시작초 종료초'"})
+    
+    # 5) 기본 검색 로직 – FAISS 및 LangChain 기반 RAG 방식 적용
     else:
         chat_response = generate_answer_with_retrieval(user_msg)
         return jsonify({"response": chat_response})
